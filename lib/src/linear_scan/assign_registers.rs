@@ -1,6 +1,7 @@
 use super::{
-    analysis::BlockPos, last_use, next_use, IntId, Intervals, Mention, MentionMap,
-    OptimalSplitStrategy, RegUses, Statistics, VirtualInterval,
+    analysis::{BlockBoundary, BlockPos},
+    last_use, next_use, IntId, Intervals, Mention, MentionMap, OptimalSplitStrategy, RegUses,
+    Safepoints, Statistics, VirtualInterval,
 };
 use crate::{
     data_structures::{InstPoint, Point, RegVecsAndBounds},
@@ -11,8 +12,8 @@ use crate::{
 use log::{debug, info, log_enabled, trace, Level};
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::collections::BinaryHeap;
 use std::{cmp, cmp::Ordering, fmt};
+use std::{collections::BinaryHeap, ops};
 
 macro_rules! lsra_assert {
     ($arg:expr) => {
@@ -196,8 +197,19 @@ pub(crate) fn run<F: Function>(
     scratches_by_rc: &[Option<RealReg>],
     intervals: Intervals,
     stats: Option<Statistics>,
+    safepoints: &Safepoints,
+    block_boundaries: &Vec<BlockBoundary>,
 ) -> Result<(Intervals, u32), RegAllocError> {
-    let mut state = State::new(opts, func, &reg_uses, scratches_by_rc, intervals, stats);
+    let mut state = State::new(
+        opts,
+        func,
+        &reg_uses,
+        safepoints,
+        block_boundaries,
+        scratches_by_rc,
+        intervals,
+        stats,
+    );
     let mut reusable = ReusableState::new(reg_universe, scratches_by_rc);
 
     #[cfg(debug_assertions)]
@@ -449,6 +461,8 @@ impl UnhandledIntervals {
 struct State<'a, F: Function> {
     func: &'a F,
     reg_uses: &'a RegUses,
+    safepoints: &'a Safepoints,
+    block_boundaries: &'a Vec<BlockBoundary>,
     opts: &'a LinearScanOptions,
 
     intervals: Intervals,
@@ -472,6 +486,8 @@ impl<'a, F: Function> State<'a, F> {
         opts: &'a LinearScanOptions,
         func: &'a F,
         reg_uses: &'a RegUses,
+        safepoints: &'a Safepoints,
+        block_boundaries: &'a Vec<BlockBoundary>,
         scratches_by_rc: &[Option<RealReg>],
         intervals: Intervals,
         stats: Option<Statistics>,
@@ -486,6 +502,8 @@ impl<'a, F: Function> State<'a, F> {
         Self {
             func,
             reg_uses,
+            safepoints,
+            block_boundaries,
             opts,
             intervals,
             unhandled,
@@ -922,11 +940,12 @@ fn maybe_handle_safepoints<F: Function>(state: &mut State<F>, id: IntId) -> bool
         return true;
     }
 
-    let next_safepoint = int.safepoints().first().clone();
-    let sp_iix = match next_safepoint {
-        Some(&(sp_iix, _)) => sp_iix,
-        None => return true,
-    };
+    let range = int.safepoints();
+    if range.start == range.end {
+        return true;
+    }
+
+    let sp_iix = state.safepoints[range.start].0;
 
     lsra_assert!(int.start.iix() <= sp_iix && sp_iix <= int.end.iix());
 
@@ -1228,19 +1247,20 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
 
     // Now split block boundaries.
     let parent_boundaries = state.intervals.get(id).block_boundaries();
-    let index = parent_boundaries.binary_search_by(|boundary| {
-        let inst_range = state.func.block_insns(boundary.bix);
-        match boundary.pos {
-            BlockPos::Start => {
-                let first_inst = InstPoint::new_use(inst_range.first());
-                return first_inst.cmp(&at_pos);
+    let index = state.block_boundaries[parent_boundaries.start..parent_boundaries.end]
+        .binary_search_by(|boundary| {
+            let inst_range = state.func.block_insns(boundary.bix);
+            match boundary.pos {
+                BlockPos::Start => {
+                    let first_inst = InstPoint::new_use(inst_range.first());
+                    return first_inst.cmp(&at_pos);
+                }
+                BlockPos::End => {
+                    let last_inst = InstPoint::new_def(inst_range.last());
+                    return last_inst.cmp(&at_pos);
+                }
             }
-            BlockPos::End => {
-                let last_inst = InstPoint::new_def(inst_range.last());
-                return last_inst.cmp(&at_pos);
-            }
-        }
-    });
+        });
 
     // It's possible that the binary search returns Err, for the edges (if the split position is
     // before the first block boundary, or after the last).
@@ -1248,25 +1268,29 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
         Ok(index) => index,
         Err(index) => index,
     };
-    let child_boundaries = state
-        .intervals
-        .get_mut(id)
-        .block_boundaries_mut()
-        .split_off(index);
+    let child_boundaries = ops::Range {
+        start: parent_boundaries.start + index,
+        end: parent_boundaries.end,
+    };
+    state.intervals.get_mut(id).block_boundaries_mut().end = parent_boundaries.start + index;
 
     // Now split the safepoints.
     let child_safepoints = {
         // Remove from the parent all the safepoints that aren't included in the new bounds.
-        let mut i = 0;
         let parent_safepoints = state.intervals.get_mut(id).safepoints_mut();
-        while let Some(&(sp_iix, _sp_ix)) = parent_safepoints.get(i) {
+        let safepoints = &state.safepoints[parent_safepoints.start..parent_safepoints.end];
+        let mut i = 0;
+        while let Some(&(sp_iix, _)) = safepoints.get(i) {
             if InstPoint::new_use(sp_iix) >= child_start {
                 break;
             }
             i += 1;
         }
-        let child = parent_safepoints.iter().skip(i).cloned().collect();
-        parent_safepoints.truncate(i);
+        let child = ops::Range {
+            start: parent_safepoints.start + i,
+            end: parent_safepoints.end,
+        };
+        parent_safepoints.end = parent_safepoints.start + i;
         child
     };
 

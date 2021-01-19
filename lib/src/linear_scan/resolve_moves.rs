@@ -1,4 +1,4 @@
-use super::{analysis::BlockPos, next_use, IntId, Location, RegUses, VirtualInterval};
+use super::{IntId, Location, RegUses, VirtualInterval, analysis::{BlockBoundary, BlockPos}, next_use};
 use crate::{
     analysis_control_flow::CFGInfo,
     data_structures::{BlockIx, InstPoint, Point},
@@ -231,6 +231,7 @@ fn collect_block_infos<F: Function>(
     intervals: &Vec<VirtualInterval>,
     liveins: &TypedIxVec<BlockIx, SparseSet<Reg>>,
     liveouts: &TypedIxVec<BlockIx, SparseSet<Reg>>,
+    block_boundaries: &[BlockBoundary]
 ) -> Vec<BlockInfo> {
     // Preallocate the block information, with the final size of each vector.
     let mut infos = Vec::with_capacity(func.blocks().len());
@@ -245,7 +246,8 @@ fn collect_block_infos<F: Function>(
     for int in intervals {
         let vreg = int.vreg;
         let id = int.id;
-        for boundary in &int.block_boundaries {
+        let range = &int.block_boundaries;
+        for boundary in &block_boundaries[range.start..range.end] {
             let bix = boundary.bix;
             let pos = boundary.pos;
             match pos {
@@ -291,6 +293,7 @@ fn resolve_moves_across_blocks<F: Function>(
     cfg: &CFGInfo,
     liveins: &TypedIxVec<BlockIx, SparseSet<Reg>>,
     liveouts: &TypedIxVec<BlockIx, SparseSet<Reg>>,
+    block_boundaries: &[BlockBoundary],
     intervals: &Vec<VirtualInterval>,
     scratches_by_rc: &[Option<RealReg>],
     spill_slot: &mut u32,
@@ -301,7 +304,7 @@ fn resolve_moves_across_blocks<F: Function>(
 ) {
     let mut parallel_move_map = HashMap::default();
 
-    let block_info = collect_block_infos(func, intervals, liveins, liveouts);
+    let block_info = collect_block_infos(func, intervals, liveins, liveouts, block_boundaries);
 
     let mut seen_successors = HashSet::default();
     for block in func.blocks() {
@@ -470,6 +473,7 @@ fn resolve_moves_across_blocks<F: Function>(
 pub(crate) fn run<F: Function>(
     func: &F,
     cfg: &CFGInfo,
+    block_boundaries: &[BlockBoundary],
     reg_uses: &RegUses,
     intervals: &Vec<VirtualInterval>,
     liveins: &TypedIxVec<BlockIx, SparseSet<Reg>>,
@@ -509,6 +513,7 @@ pub(crate) fn run<F: Function>(
         cfg,
         liveins,
         liveouts,
+        block_boundaries,
         intervals,
         scratches_by_rc,
         spill_slot,

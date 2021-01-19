@@ -15,7 +15,7 @@ use crate::{
 };
 use log::{debug, info, log_enabled, trace, Level};
 use smallvec::{smallvec, SmallVec};
-use std::{cmp::Ordering, fmt, mem};
+use std::{cmp::Ordering, fmt, mem, ops};
 
 #[derive(Clone, Copy, PartialEq, Eq, Ord)]
 pub(crate) enum BlockPos {
@@ -130,6 +130,14 @@ pub(crate) struct AnalysisInfo {
     pub(crate) liveouts: TypedIxVec<BlockIx, SparseSet<Reg>>,
     /// Maps InstIxs to BlockIxs.
     pub(crate) _inst_to_block_map: InstIxToBlockIxMap,
+
+    /// A unique vector containing all the safepoints for all the intervals. Each interval has a
+    /// range into this vector; the slice implied by the range is sorted.
+    pub(crate) safepoint_env: Safepoints,
+
+    /// A unique vector containing all the block boundaries for all the intervals. Each interval
+    /// has a range into this vector; the slice implied by the range is sorted.
+    pub(crate) block_boundary_env: Vec<BlockBoundary>,
 }
 
 #[inline(never)]
@@ -240,6 +248,9 @@ pub(crate) fn run<F: Function>(
         &liveout_sets_per_block,
     );
 
+    let mut safepoint_env = Safepoints::new();
+    let mut block_boundary_env = Vec::new();
+
     let (mut fixed_intervals, mut virtual_intervals, vreg_to_vranges) = merge_range_frags(
         func,
         &reg_universe,
@@ -249,6 +260,8 @@ pub(crate) fn run<F: Function>(
         &cfg_info,
         &vreg_classes,
         stackmap_request.is_some(),
+        &mut safepoint_env,
+        &mut block_boundary_env,
     )?;
     info!("  run_analysis: end liveness analysis");
 
@@ -287,6 +300,8 @@ pub(crate) fn run<F: Function>(
         liveins: livein_sets_per_block,
         liveouts: liveout_sets_per_block,
         _inst_to_block_map: inst_to_block_map,
+        safepoint_env,
+        block_boundary_env,
     })
 }
 
@@ -761,6 +776,8 @@ fn merge_range_frags<F: Function>(
     cfg_info: &CFGInfo,
     vreg_classes: &Vec</*vreg index,*/ RegClass>,
     wants_stackmaps: bool,
+    safepoint_env: &mut Safepoints,
+    block_boundary_env: &mut Vec<BlockBoundary>,
 ) -> Result<(Vec<FixedInterval>, Vec<VirtualInterval>, VirtualRegToRanges), AnalysisError> {
     info!("    merge_range_frags: begin");
     if log_enabled!(Level::Info) {
@@ -824,6 +841,8 @@ fn merge_range_frags<F: Function>(
                 all_frag_ixs_for_reg,
                 &frag_metrics_env,
                 frag_env,
+                safepoint_env,
+                block_boundary_env,
             )?;
             continue;
         }
@@ -851,6 +870,8 @@ fn merge_range_frags<F: Function>(
                     &[*fix],
                     &frag_metrics_env,
                     frag_env,
+                    safepoint_env,
+                    block_boundary_env,
                 )?;
                 continue;
             }
@@ -1016,6 +1037,8 @@ fn merge_range_frags<F: Function>(
                 &frag_ixs,
                 &frag_metrics_env,
                 frag_env,
+                safepoint_env,
+                block_boundary_env,
             )?;
         }
         // END merge `all_frag_ixs_for_reg` entries as much as possible
@@ -1046,6 +1069,8 @@ fn flush_interval(
     frag_ixs: &[RangeFragIx],
     metrics: &[RangeFragMetrics],
     frags: &mut Vec<RangeFrag>,
+    safepoint_env: &mut Safepoints,
+    block_boundary_env: &mut Vec<BlockBoundary>,
 ) -> Result<(), AnalysisError> {
     if reg.is_real() {
         // Append all the RangeFrags to this fixed interval. They'll get sorted later.
@@ -1080,14 +1105,16 @@ fn flush_interval(
 
         // TODO rework this!
         let mut mentions = MentionMap::with_capacity(capacity);
-        let mut safepoints: Safepoints = Default::default();
+        let safepoint_start = safepoint_env.len();
         for frag in frag_ixs.iter().map(|fix| &frags[fix.get() as usize]) {
             mentions.extend(frag.mentions.iter().cloned());
-            safepoints.extend(frag.safepoints.iter().cloned());
+            safepoint_env.extend(frag.safepoints.iter().cloned());
             start = InstPoint::min(start, frag.first);
             end = InstPoint::max(end, frag.last);
         }
-        safepoints.sort_unstable_by_key(|tuple| tuple.0);
+        let safepoint_end = safepoint_env.len();
+        safepoint_env[safepoint_start..safepoint_end].sort_unstable_by_key(|tuple| tuple.0);
+
         mentions.sort_unstable_by_key(|tuple| tuple.0);
 
         // Merge mention set that are at the same instruction.
@@ -1127,7 +1154,7 @@ fn flush_interval(
 
         // Retrieve all the block boundary information from the range metrics.
 
-        let mut block_boundaries = Vec::new();
+        let block_boundary_start = block_boundary_env.len();
         for fix in frag_ixs.iter() {
             let metric = &metrics[fix.get() as usize];
             let bix = metric.bix;
@@ -1140,34 +1167,47 @@ fn flush_interval(
             match metric.kind {
                 RangeFragKind::Local => {}
                 RangeFragKind::LiveIn => {
-                    block_boundaries.push(BlockBoundary {
+                    block_boundary_env.push(BlockBoundary {
                         bix,
                         pos: BlockPos::Start,
                     });
                 }
                 RangeFragKind::LiveOut => {
-                    block_boundaries.push(BlockBoundary {
+                    block_boundary_env.push(BlockBoundary {
                         bix,
                         pos: BlockPos::End,
                     });
                 }
                 RangeFragKind::Thru => {
-                    block_boundaries.push(BlockBoundary {
+                    block_boundary_env.push(BlockBoundary {
                         bix,
                         pos: BlockPos::Start,
                     });
-                    block_boundaries.push(BlockBoundary {
+                    block_boundary_env.push(BlockBoundary {
                         bix,
                         pos: BlockPos::End,
                     });
                 }
             }
         }
+        let block_boundary_end = block_boundary_env.len();
 
         // Lexicographic sort: first by block index, then by position.
-        block_boundaries.sort_unstable();
+        block_boundary_env[block_boundary_start..block_boundary_end].sort_unstable();
 
-        (start, end, mentions, block_boundaries, safepoints)
+        (
+            start,
+            end,
+            mentions,
+            ops::Range {
+                start: block_boundary_start,
+                end: block_boundary_end,
+            },
+            ops::Range {
+                start: safepoint_start,
+                end: safepoint_end,
+            },
+        )
     };
 
     // If any frag associated to this interval has been marked as reftyped, this is reftyped.

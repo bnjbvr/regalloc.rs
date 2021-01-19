@@ -6,9 +6,9 @@
 
 use log::{info, log_enabled, trace, Level};
 
-use std::env;
 use std::fmt;
 use std::{cmp::Ordering, default};
+use std::{env, ops::Range};
 
 use crate::{
     checker::CheckerContext, reg_maps::MentionRegUsageMapper, Function, RealRegUniverse,
@@ -25,8 +25,6 @@ use crate::{
 
 use analysis::{AnalysisInfo, RangeFrag};
 use smallvec::SmallVec;
-
-use self::analysis::{BlockBoundary, BlockPos};
 
 mod analysis;
 mod assign_registers;
@@ -205,8 +203,8 @@ pub(crate) struct VirtualInterval {
     location: Location,
 
     mentions: MentionMap,
-    block_boundaries: Vec<BlockBoundary>,
-    safepoints: Safepoints,
+    block_boundaries: Range<usize>,
+    safepoints: Range<usize>,
     start: InstPoint,
     end: InstPoint,
 }
@@ -227,32 +225,40 @@ impl fmt::Display for VirtualInterval {
         )?;
         write!(
             fmt,
-            " boundaries=[{}]",
-            self.block_boundaries
-                .iter()
-                .map(|boundary| format!(
-                    "{:?}{}",
-                    boundary.bix,
-                    if boundary.pos == BlockPos::Start {
-                        "s"
-                    } else {
-                        "e"
-                    }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
+            " boundaries=[{}, {}], safepoints=[{}, {}]",
+            self.block_boundaries.start,
+            self.block_boundaries.end,
+            self.safepoints.start,
+            self.safepoints.end
         )?;
-        if !self.safepoints.is_empty() {
-            write!(fmt, " safepoints=[")?;
-            for (i, sp) in self.safepoints.iter().enumerate() {
-                if i > 0 {
-                    write!(fmt, ", {:?}", sp.0)?;
-                } else {
-                    write!(fmt, "{:?}", sp.0)?;
-                }
-            }
-            write!(fmt, "]")?;
-        }
+        //write!(
+        //fmt,
+        //" boundaries=[{}]",
+        //self.block_boundaries
+        //.iter()
+        //.map(|boundary| format!(
+        //"{:?}{}",
+        //boundary.bix,
+        //if boundary.pos == BlockPos::Start {
+        //"s"
+        //} else {
+        //"e"
+        //}
+        //))
+        //.collect::<Vec<_>>()
+        //.join(", ")
+        //)?;
+        //if !self.safepoints.is_empty() {
+        //write!(fmt, " safepoints=[")?;
+        //for (i, sp) in self.safepoints.iter().enumerate() {
+        //if i > 0 {
+        //write!(fmt, ", {:?}", sp.0)?;
+        //} else {
+        //write!(fmt, "{:?}", sp.0)?;
+        //}
+        //}
+        //write!(fmt, "]")?;
+        //}
         Ok(())
     }
 }
@@ -264,9 +270,9 @@ impl VirtualInterval {
         start: InstPoint,
         end: InstPoint,
         mentions: MentionMap,
-        block_boundaries: Vec<BlockBoundary>,
+        block_boundaries: Range<usize>,
         ref_typed: bool,
-        safepoints: Safepoints,
+        safepoints: Range<usize>,
     ) -> Self {
         Self {
             id,
@@ -283,10 +289,10 @@ impl VirtualInterval {
             ref_typed,
         }
     }
-    fn safepoints(&self) -> &Safepoints {
+    fn safepoints(&self) -> &Range<usize> {
         &self.safepoints
     }
-    fn safepoints_mut(&mut self) -> &mut Safepoints {
+    fn safepoints_mut(&mut self) -> &mut Range<usize> {
         &mut self.safepoints
     }
     fn mentions(&self) -> &MentionMap {
@@ -295,10 +301,10 @@ impl VirtualInterval {
     fn mentions_mut(&mut self) -> &mut MentionMap {
         &mut self.mentions
     }
-    fn block_boundaries(&self) -> &[BlockBoundary] {
+    fn block_boundaries(&self) -> &Range<usize> {
         &self.block_boundaries
     }
-    fn block_boundaries_mut(&mut self) -> &mut Vec<BlockBoundary> {
+    fn block_boundaries_mut(&mut self) -> &mut Range<usize> {
         &mut self.block_boundaries
     }
     fn covers(&self, pos: InstPoint) -> bool {
@@ -635,6 +641,8 @@ pub(crate) fn run<F: Function>(
         liveins,
         liveouts,
         cfg,
+        safepoint_env,
+        block_boundary_env,
         ..
     } = analysis::run(func, reg_universe, stackmap_request)
         .map_err(|err| RegAllocError::Analysis(err))?;
@@ -680,6 +688,8 @@ pub(crate) fn run<F: Function>(
         &scratches_by_rc,
         intervals,
         stats,
+        &safepoint_env,
+        &block_boundary_env,
     )?;
 
     let virtuals = &intervals.virtuals;
@@ -687,6 +697,7 @@ pub(crate) fn run<F: Function>(
     let memory_moves = resolve_moves::run(
         func,
         &cfg,
+        &block_boundary_env,
         &reg_uses,
         virtuals,
         &liveins,
@@ -703,6 +714,7 @@ pub(crate) fn run<F: Function>(
         num_spill_slots,
         use_checker,
         stackmap_request,
+        &safepoint_env,
     )
 }
 
@@ -855,6 +867,7 @@ fn set_registers<F: Function>(
 fn compute_stackmaps(
     intervals: &[VirtualInterval],
     stackmap_request: Option<&StackmapRequestInfo>,
+    safepoint_env: &Safepoints,
 ) -> Vec<Vec<SpillSlot>> {
     if let Some(request) = stackmap_request {
         let mut stackmaps = vec![Vec::new(); request.safepoint_insns.len()];
@@ -863,7 +876,8 @@ fn compute_stackmaps(
                 continue;
             }
             if let Some(slot) = int.location.spill() {
-                for &(_sp_iix, sp_ix) in &int.safepoints {
+                let b = &int.safepoints;
+                for &(_sp_iix, sp_ix) in &safepoint_env[b.start..b.end] {
                     stackmaps[sp_ix].push(slot);
                 }
             }
@@ -884,10 +898,11 @@ fn apply_registers<F: Function>(
     num_spill_slots: u32,
     use_checker: bool,
     stackmap_request: Option<&StackmapRequestInfo>,
+    safepoint_env: &Safepoints,
 ) -> Result<RegAllocResult<F>, RegAllocError> {
     info!("apply_registers");
 
-    let stackmaps = compute_stackmaps(virtual_intervals, stackmap_request.clone());
+    let stackmaps = compute_stackmaps(virtual_intervals, stackmap_request.clone(), safepoint_env);
 
     let clobbered_registers = set_registers(
         func,
