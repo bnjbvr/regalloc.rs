@@ -1,4 +1,7 @@
-use super::{FixedInterval, IntId, Intervals, Mention, MentionMap, Safepoints, VirtualInterval};
+use super::{
+    FixedInterval, InstMention, InstMentionMap, IntId, Intervals, MentionSet, Safepoints,
+    VirtualInterval,
+};
 use crate::{
     analysis_control_flow::{CFGInfo, InstIxToBlockIxMap},
     analysis_data_flow::collect_move_info,
@@ -46,7 +49,7 @@ pub(crate) struct BlockBoundary {
 pub(crate) struct RangeFrag {
     pub(crate) first: InstPoint,
     pub(crate) last: InstPoint,
-    pub(crate) mentions: MentionMap,
+    pub(crate) mentions: InstMentionMap,
     pub(crate) safepoints: Safepoints,
     pub(crate) ref_typed: bool,
 }
@@ -75,7 +78,7 @@ impl RangeFrag {
         bix: BlockIx,
         first: InstPoint,
         last: InstPoint,
-        mentions: MentionMap,
+        mentions: InstMentionMap,
         ref_typed: bool,
         safepoints: Safepoints,
     ) -> (Self, RangeFragMetrics) {
@@ -469,7 +472,7 @@ fn get_range_frags_for_block<F: Function>(
         let reg_state_ix = reg_to_reg_ix(num_real_regs, *reg) as usize;
         debug_assert!(state[reg_state_ix].is_none());
         state[reg_state_ix] = Some(RangeFrag {
-            mentions: MentionMap::new(),
+            mentions: InstMentionMap::new(),
             first: first_pt_in_block,
             last: first_pt_in_block,
             safepoints: Default::default(),
@@ -504,10 +507,12 @@ fn get_range_frags_for_block<F: Function>(
 
             // This first loop iterates over all the uses for the first time, so there shouldn't be
             // any duplicates.
-            debug_assert!(!prev_frag.mentions.iter().any(|tuple| tuple.0 == inst_ix));
-            let mut mention_set = Mention::new();
+            debug_assert!(!prev_frag.mentions.iter().any(|tuple| tuple.iix == inst_ix));
+            let mut mention_set = MentionSet::new();
             mention_set.add_use();
-            prev_frag.mentions.push((inst_ix, mention_set));
+            prev_frag
+                .mentions
+                .push(InstMention::new(inst_ix, mention_set));
         }
 
         // Examine modifies.  These are handled almost identically to reads, except that they
@@ -527,8 +532,8 @@ fn get_range_frags_for_block<F: Function>(
             debug_assert!(prev_frag.last <= new_last);
             prev_frag.last = new_last;
 
-            prev_frag.mentions.push((inst_ix, {
-                let mut mention_set = Mention::new();
+            prev_frag.mentions.push(InstMention::new(inst_ix, {
+                let mut mention_set = MentionSet::new();
                 mention_set.add_mod();
                 mention_set
             }));
@@ -548,12 +553,12 @@ fn get_range_frags_for_block<F: Function>(
                 // Start a new RangeFrag for it and keep going.
                 None => {
                     let new_pt = InstPoint::new_def(inst_ix);
-                    let mut mention_set = Mention::new();
+                    let mut mention_set = MentionSet::new();
                     mention_set.add_def();
                     state[reg_state_ix] = Some(RangeFrag {
                         first: new_pt,
                         last: new_pt,
-                        mentions: smallvec![(inst_ix, mention_set)],
+                        mentions: smallvec![InstMention::new(inst_ix, mention_set)],
                         ref_typed: false,
                         safepoints: smallvec![],
                     })
@@ -569,7 +574,7 @@ fn get_range_frags_for_block<F: Function>(
                     ref mut safepoints,
                 }) => {
                     // Steal the mentions and replace the mutable ref by an empty vector for reuse.
-                    let stolen_mentions = mem::replace(mentions, MentionMap::new());
+                    let stolen_mentions = mem::replace(mentions, InstMentionMap::new());
                     let stolen_safepoints = mem::replace(safepoints, Default::default());
 
                     let (frag, frag_metrics) = RangeFrag::new(
@@ -583,9 +588,9 @@ fn get_range_frags_for_block<F: Function>(
                     );
                     emit_range_frag(*reg, frag, frag_metrics, num_real_regs);
 
-                    let mut mention_set = Mention::new();
+                    let mut mention_set = MentionSet::new();
                     mention_set.add_def();
-                    mentions.push((inst_ix, mention_set));
+                    mentions.push(InstMention::new(inst_ix, mention_set));
 
                     // Reuse the previous entry for this new definition of the same vreg.
                     let new_pt = InstPoint::new_def(inst_ix);
@@ -628,7 +633,7 @@ fn get_range_frags_for_block<F: Function>(
                 bix,
                 prev_frag.first,
                 prev_frag.last,
-                mem::replace(&mut prev_frag.mentions, MentionMap::new()),
+                mem::replace(&mut prev_frag.mentions, InstMentionMap::new()),
                 prev_frag.ref_typed,
                 mem::replace(&mut prev_frag.safepoints, Default::default()),
             );
@@ -1056,7 +1061,7 @@ fn flush_interval(
             fixed_int.frags.push(RangeFrag {
                 first: frag.first,
                 last: frag.last,
-                mentions: mem::replace(&mut frag.mentions, MentionMap::new()),
+                mentions: mem::replace(&mut frag.mentions, InstMentionMap::new()),
                 ref_typed: false,
                 safepoints: Default::default(),
             })
@@ -1079,7 +1084,7 @@ fn flush_interval(
         // Merge all the register mentions and safepoints together.
 
         // TODO rework this!
-        let mut mentions = MentionMap::with_capacity(capacity);
+        let mut mentions = InstMentionMap::with_capacity(capacity);
         let mut safepoints: Safepoints = Default::default();
         for frag in frag_ixs.iter().map(|fix| &frags[fix.get() as usize]) {
             mentions.extend(frag.mentions.iter().cloned());
@@ -1088,7 +1093,7 @@ fn flush_interval(
             end = InstPoint::max(end, frag.last);
         }
         safepoints.sort_unstable_by_key(|tuple| tuple.0);
-        mentions.sort_unstable_by_key(|tuple| tuple.0);
+        mentions.sort_unstable_by_key(|tuple| tuple.iix);
 
         // Merge mention set that are at the same instruction.
         let mut s = 0;
@@ -1096,20 +1101,20 @@ fn flush_interval(
         let mut to_remove = Vec::new();
         while s < mentions.len() {
             e = s;
-            while e + 1 < mentions.len() && mentions[s].0 == mentions[e + 1].0 {
+            while e + 1 < mentions.len() && mentions[s].iix == mentions[e + 1].iix {
                 e += 1;
             }
             if s != e {
                 let mut i = s + 1;
                 while i <= e {
-                    if mentions[i].1.is_use() {
-                        mentions[s].1.add_use();
+                    if mentions[i].set.has_use() {
+                        mentions[s].set.add_use();
                     }
-                    if mentions[i].1.is_mod() {
-                        mentions[s].1.add_mod();
+                    if mentions[i].set.has_mod() {
+                        mentions[s].set.add_mod();
                     }
-                    if mentions[i].1.is_def() {
-                        mentions[s].1.add_def();
+                    if mentions[i].set.has_def() {
+                        mentions[s].set.add_def();
                     }
                     i += 1;
                 }

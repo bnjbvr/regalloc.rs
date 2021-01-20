@@ -204,7 +204,7 @@ pub(crate) struct VirtualInterval {
     /// Location assigned to this live interval.
     location: Location,
 
-    mentions: MentionMap,
+    mentions: InstMentionMap,
     block_boundaries: Vec<BlockBoundary>,
     safepoints: Safepoints,
     start: InstPoint,
@@ -263,7 +263,7 @@ impl VirtualInterval {
         vreg: VirtualReg,
         start: InstPoint,
         end: InstPoint,
-        mentions: MentionMap,
+        mentions: InstMentionMap,
         block_boundaries: Vec<BlockBoundary>,
         ref_typed: bool,
         safepoints: Safepoints,
@@ -289,10 +289,10 @@ impl VirtualInterval {
     fn safepoints_mut(&mut self) -> &mut Safepoints {
         &mut self.safepoints
     }
-    fn mentions(&self) -> &MentionMap {
+    fn mentions(&self) -> &InstMentionMap {
         &self.mentions
     }
-    fn mentions_mut(&mut self) -> &mut MentionMap {
+    fn mentions_mut(&mut self) -> &mut InstMentionMap {
         &mut self.mentions
     }
     fn block_boundaries(&self) -> &[BlockBoundary] {
@@ -309,9 +309,9 @@ impl VirtualInterval {
 /// This data structure tracks the mentions of a register (virtual or real) at a precise
 /// instruction point. It's a set encoded as three flags, one for each of use/mod/def.
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
-pub struct Mention(u8);
+pub struct MentionSet(u8);
 
-impl fmt::Debug for Mention {
+impl fmt::Debug for MentionSet {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let mut comma = false;
         if self.0 & 1 == 1 {
@@ -335,7 +335,7 @@ impl fmt::Debug for Mention {
     }
 }
 
-impl Mention {
+impl MentionSet {
     fn new() -> Self {
         Self(0)
     }
@@ -352,24 +352,40 @@ impl Mention {
     }
 
     // Getters.
-    fn is_use(&self) -> bool {
+    fn has_use(&self) -> bool {
         (self.0 & 0b001) != 0
     }
-    fn is_mod(&self) -> bool {
+    fn has_mod(&self) -> bool {
         (self.0 & 0b010) != 0
     }
-    fn is_def(&self) -> bool {
+    fn has_def(&self) -> bool {
         (self.0 & 0b100) != 0
     }
-    fn is_use_or_mod(&self) -> bool {
+    fn has_use_or_mod(&self) -> bool {
         (self.0 & 0b011) != 0
     }
-    fn is_mod_or_def(&self) -> bool {
+    fn has_mod_or_def(&self) -> bool {
         (self.0 & 0b110) != 0
     }
 }
 
-pub type MentionMap = SmallVec<[(InstIx, Mention); 2]>;
+/// A set containing all the mentions (use, mod, def) at a given instruction index. A register
+/// (real or virtual) is implied by the owner of this InstMention.
+///
+/// TODO: packing: iix is limited to 2**24, so we can easily pack 3 more bits in a single u32.
+#[derive(Clone, Debug)]
+pub(crate) struct InstMention {
+    pub(crate) iix: InstIx,
+    pub(crate) set: MentionSet,
+}
+
+impl InstMention {
+    pub(crate) fn new(iix: InstIx, set: MentionSet) -> Self {
+        Self { iix, set }
+    }
+}
+
+pub(crate) type InstMentionMap = SmallVec<[InstMention; 2]>;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Location {
@@ -463,27 +479,27 @@ fn next_use(interval: &VirtualInterval, pos: InstPoint, _reg_uses: &RegUses) -> 
     let mentions = interval.mentions();
     let target = InstPoint::max(pos, interval.start);
 
-    let ret = match mentions.binary_search_by_key(&target.iix(), |mention| mention.0) {
+    let ret = match mentions.binary_search_by_key(&target.iix(), |mention| mention.iix) {
         Ok(index) => {
             // Either the selected index is a perfect match, or the next mention is
             // the correct answer.
             let mention = &mentions[index];
             if target.pt() == Point::Use {
-                if mention.1.is_use_or_mod() {
-                    Some(InstPoint::new_use(mention.0))
+                if mention.set.has_use_or_mod() {
+                    Some(InstPoint::new_use(mention.iix))
                 } else {
-                    Some(InstPoint::new_def(mention.0))
+                    Some(InstPoint::new_def(mention.iix))
                 }
-            } else if target.pt() == Point::Def && mention.1.is_mod_or_def() {
+            } else if target.pt() == Point::Def && mention.set.has_mod_or_def() {
                 Some(target)
             } else if index == mentions.len() - 1 {
                 None
             } else {
                 let mention = &mentions[index + 1];
-                if mention.1.is_use_or_mod() {
-                    Some(InstPoint::new_use(mention.0))
+                if mention.set.has_use_or_mod() {
+                    Some(InstPoint::new_use(mention.iix))
                 } else {
-                    Some(InstPoint::new_def(mention.0))
+                    Some(InstPoint::new_def(mention.iix))
                 }
             }
         }
@@ -493,10 +509,10 @@ fn next_use(interval: &VirtualInterval, pos: InstPoint, _reg_uses: &RegUses) -> 
                 None
             } else {
                 let mention = &mentions[index];
-                if mention.1.is_use_or_mod() {
-                    Some(InstPoint::new_use(mention.0))
+                if mention.set.has_use_or_mod() {
+                    Some(InstPoint::new_use(mention.iix))
                 } else {
-                    Some(InstPoint::new_def(mention.0))
+                    Some(InstPoint::new_def(mention.iix))
                 }
             }
         }
@@ -531,27 +547,27 @@ fn last_use(interval: &VirtualInterval, pos: InstPoint, _reg_uses: &RegUses) -> 
 
     let target = InstPoint::min(pos, interval.end);
 
-    let ret = match mentions.binary_search_by_key(&target.iix(), |mention| mention.0) {
+    let ret = match mentions.binary_search_by_key(&target.iix(), |mention| mention.iix) {
         Ok(index) => {
             // Either the selected index is a perfect match, or the previous mention
             // is the correct answer.
             let mention = &mentions[index];
             if target.pt() == Point::Def {
-                if mention.1.is_mod_or_def() {
-                    Some(InstPoint::new_def(mention.0))
+                if mention.set.has_mod_or_def() {
+                    Some(InstPoint::new_def(mention.iix))
                 } else {
-                    Some(InstPoint::new_use(mention.0))
+                    Some(InstPoint::new_use(mention.iix))
                 }
-            } else if target.pt() == Point::Use && mention.1.is_use() {
+            } else if target.pt() == Point::Use && mention.set.has_use() {
                 Some(target)
             } else if index == 0 {
                 None
             } else {
                 let mention = &mentions[index - 1];
-                if mention.1.is_mod_or_def() {
-                    Some(InstPoint::new_def(mention.0))
+                if mention.set.has_mod_or_def() {
+                    Some(InstPoint::new_def(mention.iix))
                 } else {
-                    Some(InstPoint::new_use(mention.0))
+                    Some(InstPoint::new_use(mention.iix))
                 }
             }
         }
@@ -561,10 +577,10 @@ fn last_use(interval: &VirtualInterval, pos: InstPoint, _reg_uses: &RegUses) -> 
                 None
             } else {
                 let mention = &mentions[index - 1];
-                if mention.1.is_mod_or_def() {
-                    Some(InstPoint::new_def(mention.0))
+                if mention.set.has_mod_or_def() {
+                    Some(InstPoint::new_def(mention.iix))
                 } else {
-                    Some(InstPoint::new_use(mention.0))
+                    Some(InstPoint::new_use(mention.iix))
                 }
             }
         }
@@ -666,7 +682,7 @@ pub(crate) fn run<F: Function>(
         for int in &intervals.virtuals {
             trace!("{}", int);
             for mention in &int.mentions {
-                trace!("  mention @ {:?}: {:?}", mention.0, mention.1);
+                trace!("  mention @ {:?}: {:?}", mention.iix, mention.set);
             }
         }
         trace!("");
@@ -740,8 +756,8 @@ fn set_registers<F: Function>(
         };
         trace!("int: {}", int);
         trace!("  {:?}", int.mentions);
-        for &mention in &int.mentions {
-            mention_map.push((mention.0, mention.1, int.vreg, rreg));
+        for mention in &int.mentions {
+            mention_map.push((mention.iix, mention.set, int.vreg, rreg));
         }
     }
 
@@ -789,7 +805,7 @@ fn set_registers<F: Function>(
             );
 
             // Fill in new information at the given index.
-            if mention_set.is_use() {
+            if mention_set.has_use() {
                 if let Some(prev_rreg) = mapper.lookup_use(*vreg) {
                     debug_assert_eq!(prev_rreg, *rreg, "different use allocs for {:?}", vreg);
                 }
@@ -797,7 +813,7 @@ fn set_registers<F: Function>(
             }
 
             let included_in_clobbers = func.is_included_in_clobbers(func.get_insn(*iix));
-            if mention_set.is_mod() {
+            if mention_set.has_mod() {
                 if let Some(prev_rreg) = mapper.lookup_use(*vreg) {
                     debug_assert_eq!(prev_rreg, *rreg, "different use allocs for {:?}", vreg);
                 }
@@ -812,7 +828,7 @@ fn set_registers<F: Function>(
                 }
             }
 
-            if mention_set.is_def() {
+            if mention_set.has_def() {
                 if let Some(prev_rreg) = mapper.lookup_def(*vreg) {
                     debug_assert_eq!(prev_rreg, *rreg, "different def allocs for {:?}", *vreg);
                 }

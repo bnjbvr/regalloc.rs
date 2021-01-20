@@ -1,10 +1,10 @@
 use super::{
-    analysis::BlockPos, last_use, next_use, IntId, Intervals, Mention, MentionMap,
-    OptimalSplitStrategy, RegUses, Statistics, VirtualInterval,
+    analysis::BlockPos, last_use, next_use, InstMentionMap, IntId, Intervals, OptimalSplitStrategy,
+    RegUses, Statistics, VirtualInterval,
 };
 use crate::{
     data_structures::{InstPoint, Point, RegVecsAndBounds},
-    Function, InstIx, LinearScanOptions, RealReg, RealRegUniverse, Reg, RegAllocError, SpillSlot,
+    Function, InstIx, LinearScanOptions, RealReg, RealRegUniverse, RegAllocError, SpillSlot,
     VirtualReg, NUM_REG_CLASSES,
 };
 
@@ -1045,6 +1045,7 @@ fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: Inst
             let optimal_pos = if after_last_use >= split_pos {
                 // Either last_use is split_pos, or it is just before. We have to split at
                 // split_pos then to fulfill the caller's want.
+                // TODO: if it's a MOD, then we should take the position before.
                 split_pos
             } else {
                 // Any position in this interval is valid and won't interfere with the previous
@@ -1192,7 +1193,7 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
         // The comparator function returns the position of the argument compared to the target.
 
         // Search by index first.
-        let iix = mention.0;
+        let iix = mention.iix;
         if iix < at_pos.iix() {
             return Ordering::Less;
         }
@@ -1202,9 +1203,9 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
 
         // The instruction index is the same. Consider the instruction side now, and compare it
         // with the set. For the purpose of LSRA, mod means use and def.
-        let set = mention.1;
+        let set = mention.set;
         if at_pos.pt() == Point::Use {
-            if set.is_use_or_mod() {
+            if set.has_use_or_mod() {
                 Ordering::Equal
             } else {
                 // It has to be Mod or Def. We need to look more to the right of the seeked array.
@@ -1213,7 +1214,7 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
             }
         } else {
             debug_assert!(at_pos.pt() == Point::Def);
-            if set.is_mod_or_def() {
+            if set.has_mod_or_def() {
                 Ordering::Equal
             } else {
                 // Look to the left.
@@ -1224,7 +1225,7 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
 
     let index = match index {
         Ok(index) => {
-            let found = parent_mentions[index];
+            let found = &parent_mentions[index];
             // If the interval has a mention precisely at the split position, then either the split
             // position must be at the use point, or the mention set mustn't contain a mod.
             // Otherwise, we're trying to split, at a def point, an interval which has a mod
@@ -1232,14 +1233,14 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
             // removing the dependency between the tied in-out operand, which would lead to an
             // incorrect allocation.
             assert!(
-                at_pos.pt() == Point::Use || at_pos.iix() != found.0 || !found.1.is_mod(),
+                at_pos.pt() == Point::Use || at_pos.iix() != found.iix || !found.set.has_mod(),
                 "trying to split a mod in two"
             );
             index
         }
         Err(index) => index,
     };
-    let mut child_mentions = MentionMap::with_capacity(parent_mentions.len() - index);
+    let mut child_mentions = InstMentionMap::with_capacity(parent_mentions.len() - index);
     for mention in parent_mentions.iter().skip(index) {
         child_mentions.push(mention.clone());
     }
@@ -1318,42 +1319,4 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
     }
 
     child_id
-}
-
-fn _build_mention_map(reg_uses: &RegUses) -> HashMap<Reg, MentionMap> {
-    // Maps reg to its mentions.
-    let mut reg_mentions: HashMap<Reg, MentionMap> = HashMap::default();
-
-    // Collect all the mentions.
-    for i in 0..reg_uses.num_insns() {
-        let iix = InstIx::new(i as u32);
-        let regsets = reg_uses.get_reg_sets_for_iix(iix);
-        debug_assert!(regsets.is_sanitized());
-
-        for reg in regsets.uses.iter() {
-            let mentions = reg_mentions.entry(*reg).or_default();
-            if mentions.is_empty() || mentions.last().unwrap().0 != iix {
-                mentions.push((iix, Mention::new()));
-            }
-            mentions.last_mut().unwrap().1.add_use();
-        }
-
-        for reg in regsets.mods.iter() {
-            let mentions = reg_mentions.entry(*reg).or_default();
-            if mentions.is_empty() || mentions.last().unwrap().0 != iix {
-                mentions.push((iix, Mention::new()));
-            }
-            mentions.last_mut().unwrap().1.add_mod();
-        }
-
-        for reg in regsets.defs.iter() {
-            let mentions = reg_mentions.entry(*reg).or_default();
-            if mentions.is_empty() || mentions.last().unwrap().0 != iix {
-                mentions.push((iix, Mention::new()));
-            }
-            mentions.last_mut().unwrap().1.add_def();
-        }
-    }
-
-    reg_mentions
 }
