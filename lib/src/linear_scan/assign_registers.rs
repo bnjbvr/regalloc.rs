@@ -1032,6 +1032,8 @@ fn next_pos(mut pos: InstPoint) -> InstPoint {
 /// returns the live interval id for the middle child, to be added back to the
 /// list of active/inactive intervals after iterating on these.
 fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: InstPoint) {
+    debug_assert!(state.intervals.get(id).covers(split_pos));
+
     let child = match last_use(&state.intervals.get(id), split_pos, &state.reg_uses) {
         Some(last_use) => {
             debug!(
@@ -1039,12 +1041,16 @@ fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: Inst
                 id, last_use, split_pos
             );
 
-            // Maintain ascending order between the min and max positions.
-            let min_pos = InstPoint::min(next_pos(last_use), split_pos);
-
-            // Make sure that if the two positions are the same, we'll be splitting in
-            // a position that's in the current interval.
-            let optimal_pos = find_optimal_split_pos(state, id, min_pos, split_pos);
+            let after_last_use = next_pos(last_use);
+            let optimal_pos = if after_last_use >= split_pos {
+                // Either last_use is split_pos, or it is just before. We have to split at
+                // split_pos then to fulfill the caller's want.
+                split_pos
+            } else {
+                // Any position in this interval is valid and won't interfere with the previous
+                // mention.
+                find_optimal_split_pos(state, id, after_last_use, split_pos)
+            };
 
             let child = split(state, id, optimal_pos);
             state.spill(child);
