@@ -639,6 +639,13 @@ pub fn parse_content(func_name: &str, content: &str) -> ParseResult<Func> {
                     insts.push(i_fsub(dst, src_left, src_right));
                 }
 
+                "fcossin" => {
+                    let src_cos = parser.read_var()?;
+                    parser.expect_char(',')?;
+                    let dst_sin = parser.read_var()?;
+                    insts.push(Inst::FCosSin { src_cos, dst_sin });
+                }
+
                 "finish" => {
                     let return_val = parser
                         .try_read_ident_sameline()

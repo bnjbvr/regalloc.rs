@@ -191,6 +191,7 @@ impl FuzzingEnv {
             StoreF,
             MakeRef,
             UseRef,
+            FCosSin,
         }
 
         let mut allowed_insts = Vec::new();
@@ -216,6 +217,7 @@ impl FuzzingEnv {
         if self.can_use_reg(F32) {
             allowed_insts.push(AllowedInst::CopyF);
             allowed_insts.push(AllowedInst::BinOpF);
+            allowed_insts.push(AllowedInst::FCosSin);
         }
         if self.can_def_reftyped_reg() && self.can_use_reg(I32) {
             allowed_insts.push(AllowedInst::MakeRef);
@@ -286,6 +288,14 @@ impl FuzzingEnv {
                     dst: self.def_reg(F32, u)?,
                     src_left,
                     src_right,
+                }
+            }
+            AllowedInst::FCosSin => {
+                let src = self.get_reg(F32, u)?;
+                let dst = self.get_reg(F32, u)?;
+                FCosSin {
+                    src_cos: src,
+                    dst_sin: dst,
                 }
             }
             AllowedInst::Load => {

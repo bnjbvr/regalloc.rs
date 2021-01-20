@@ -1,0 +1,25 @@
+v0F = F32
+v1F = F32
+v2F = F32
+r0F = real F32 5
+r1F = real F32 6
+
+b0:
+    immf    v1F, 8867872600000000000000000000000000000.0
+    immf    v0F, 120377080000000000.0
+    goto b2
+
+b1:
+    immf    r1F, 42.0
+    fmul    r0F, r1F, v0F
+    immf    v2F, 0.000000000000000000000000000000000000023509886
+    goto    b3:b3
+
+b2:
+    fcossin v1F, v0F
+    goto    b1:b1
+
+b3:
+    fcossin v2F, r1F
+    fdiv    r1F, r0F, r0F
+    goto    b3:b3

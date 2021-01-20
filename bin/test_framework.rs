@@ -342,14 +342,21 @@ pub enum Inst {
     },
     BinOpM {
         op: BinOp,
+        /// In-out (mod) destination register.
         dst: Reg,
         src_right: RI,
-    }, // "mod" semantics for `dst`
+    },
     BinOpF {
         op: BinOpF,
         dst: Reg,
         src_left: Reg,
         src_right: Reg,
+    },
+    FCosSin {
+        /// In-out (mod) register for cosinus.
+        src_cos: Reg,
+        /// Destination (def) register for sinus.
+        dst_sin: Reg,
     },
     Load {
         dst: Reg,
@@ -798,6 +805,9 @@ impl fmt::Debug for Inst {
                 src_left,
                 src_right
             ),
+            Inst::FCosSin { src_cos, dst_sin } => {
+                write!(fmt, "fcossin {:?}, {:?}", src_cos, dst_sin)
+            }
             Inst::Load { dst, addr } => write!(fmt, "load    {:?}, {:?}", dst, addr),
             Inst::LoadF { dst, addr } => write!(fmt, "loadf   {:?}, {:?}", dst, addr),
             Inst::Store { addr, src } => write!(fmt, "store   {:?}, {:?}", addr, src),
@@ -917,6 +927,10 @@ impl Inst {
                 collector.add_use(*src_left);
                 collector.add_use(*src_right);
             }
+            Inst::FCosSin { src_cos, dst_sin } => {
+                collector.add_mod(Writable::from_reg(*src_cos));
+                collector.add_def(Writable::from_reg(*dst_sin));
+            }
             Inst::Store { addr, src } => {
                 addr.add_reg_reads_to(collector);
                 collector.add_use(*src);
@@ -1018,6 +1032,10 @@ impl Inst {
                 dst.apply_defs(mapper);
                 src_left.apply_uses(mapper);
                 src_right.apply_uses(mapper);
+            }
+            Inst::FCosSin { src_cos, dst_sin } => {
+                src_cos.apply_mods(mapper);
+                dst_sin.apply_defs(mapper);
             }
             Inst::MakeRef { dst, src } => {
                 dst.apply_defs(mapper);
@@ -1161,6 +1179,10 @@ impl Inst {
                 cx.check_reg_rc(src_left, RegRef::Use, F32)
                     && cx.check_reg_rc(src_right, RegRef::Use, F32)
                     && cx.check_reg_rc(dst, RegRef::Def, F32)
+            }
+            Inst::FCosSin { src_cos, dst_sin } => {
+                cx.check_reg_rc(src_cos, RegRef::Use, F32)
+                    && cx.check_reg_rc(dst_sin, RegRef::Def, F32)
             }
             Inst::Safepoint => true,
 
@@ -1516,6 +1538,13 @@ impl<'a> IState<'a> {
                 let src_right_v = self.get_reg(*src_right)?.to_f32();
                 let dst_v = op.calc(src_left_v, src_right_v)?;
                 self.set_reg_f32(*dst, dst_v);
+            }
+            Inst::FCosSin { src_cos, dst_sin } => {
+                let src = self.get_reg(*src_cos)?.to_f32();
+                let cos = f32::cos(src);
+                let sin = f32::sin(src);
+                self.set_reg_f32(*src_cos, cos);
+                self.set_reg_f32(*dst_sin, sin);
             }
             Inst::MakeRef { dst, src } => {
                 let src_v = self.get_reg(*src)?.to_u32();
