@@ -1223,7 +1223,20 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
     });
 
     let index = match index {
-        Ok(index) => index,
+        Ok(index) => {
+            let found = parent_mentions[index];
+            // If the interval has a mention precisely at the split position, then either the split
+            // position must be at the use point, or the mention set mustn't contain a mod.
+            // Otherwise, we're trying to split, at a def point, an interval which has a mod
+            // mention at the same instruction: that means splitting a mod into two parts, thus
+            // removing the dependency between the tied in-out operand, which would lead to an
+            // incorrect allocation.
+            assert!(
+                at_pos.pt() == Point::Use || at_pos.iix() != found.0 || !found.1.is_mod(),
+                "trying to split a mod in two"
+            );
+            index
+        }
         Err(index) => index,
     };
     let mut child_mentions = MentionMap::with_capacity(parent_mentions.len() - index);
