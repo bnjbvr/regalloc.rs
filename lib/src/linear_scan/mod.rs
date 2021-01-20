@@ -373,10 +373,23 @@ impl MentionSet {
 /// (real or virtual) is implied by the owner of this InstMention.
 ///
 /// TODO: packing: iix is limited to 2**24, so we can easily pack 3 more bits in a single u32.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct InstMention {
     pub(crate) iix: InstIx,
     pub(crate) set: MentionSet,
+}
+
+impl fmt::Debug for InstMention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?}:{}{}{}",
+            self.iix,
+            if self.set.has_use() { "u" } else { "" },
+            if self.set.has_mod() { "m" } else { "" },
+            if self.set.has_def() { "d" } else { "" },
+        )
+    }
 }
 
 impl InstMention {
@@ -534,75 +547,32 @@ fn next_use(interval: &VirtualInterval, pos: InstPoint, _reg_uses: &RegUses) -> 
     ret
 }
 
-/// Finds the last use of a vreg before a given target, including it in possible
-/// return values.
-/// Extends to the right, that is, modified means "def".
 #[inline(never)]
-fn last_use(interval: &VirtualInterval, pos: InstPoint, _reg_uses: &RegUses) -> Option<InstPoint> {
-    if log_enabled!(Level::Trace) {
-        trace!("searching last use of {} before {:?}", interval, pos,);
-    }
-
+fn last_mention(interval: &VirtualInterval, pos: InstPoint) -> Option<InstMention> {
     let mentions = interval.mentions();
-
-    let target = InstPoint::min(pos, interval.end);
-
-    let ret = match mentions.binary_search_by_key(&target.iix(), |mention| mention.iix) {
+    match mentions.binary_search_by_key(&pos.iix(), |mention| mention.iix) {
         Ok(index) => {
-            // Either the selected index is a perfect match, or the previous mention
-            // is the correct answer.
-            let mention = &mentions[index];
-            if target.pt() == Point::Def {
-                if mention.set.has_mod_or_def() {
-                    Some(InstPoint::new_def(mention.iix))
-                } else {
-                    Some(InstPoint::new_use(mention.iix))
-                }
-            } else if target.pt() == Point::Use && mention.set.has_use() {
-                Some(target)
-            } else if index == 0 {
-                None
+            // Precise match. If we're looking for anything before (including) the def we're done:
+            // the mention set contains one of use/mod/def. Otherwise, we're looking for any
+            // mention before (including) the use point, so the mention set should include it.
+            if pos.pt() == Point::Def || mentions[index].set.has_use() {
+                Some(mentions[index])
+            } else if index > 0 {
+                // Otherwise, if we're not on the first element, the right mention is the previous
+                // element.
+                Some(mentions[index - 1])
             } else {
-                let mention = &mentions[index - 1];
-                if mention.set.has_mod_or_def() {
-                    Some(InstPoint::new_def(mention.iix))
-                } else {
-                    Some(InstPoint::new_use(mention.iix))
-                }
+                None
             }
         }
-
         Err(index) => {
             if index == 0 {
                 None
             } else {
-                let mention = &mentions[index - 1];
-                if mention.set.has_mod_or_def() {
-                    Some(InstPoint::new_def(mention.iix))
-                } else {
-                    Some(InstPoint::new_use(mention.iix))
-                }
+                Some(mentions[index - 1])
             }
         }
-    };
-
-    // TODO once the mentions are properly split, this could be removed, in
-    // theory.
-    let ret = match ret {
-        Some(pos) => {
-            if pos >= interval.start {
-                Some(pos)
-            } else {
-                None
-            }
-        }
-        None => None,
-    };
-
-    trace!("mentions: {:?}", mentions);
-    trace!("found: {:?}", ret);
-
-    ret
+    }
 }
 
 /// Checks that each register class has its own scratch register in addition to one available

@@ -1,6 +1,6 @@
 use super::{
-    analysis::BlockPos, last_use, next_use, InstMentionMap, IntId, Intervals, OptimalSplitStrategy,
-    RegUses, Statistics, VirtualInterval,
+    analysis::BlockPos, last_mention, next_use, InstMentionMap, IntId, Intervals,
+    OptimalSplitStrategy, RegUses, Statistics, VirtualInterval,
 };
 use crate::{
     data_structures::{InstPoint, Point, RegVecsAndBounds},
@@ -717,14 +717,16 @@ fn allocate_blocked_reg<F: Function>(
     cur_id: IntId,
     state: &mut State<F>,
 ) -> Result<(), RegAllocError> {
-    // If the current interval has no uses, spill it directly.
-    let first_use = match next_use(
-        &state.intervals.get(cur_id),
-        InstPoint::min_value(),
-        &state.reg_uses,
-    ) {
-        Some(u) => u,
+    let first_use = match state.intervals.get(cur_id).mentions().get(0) {
+        Some(mention) => {
+            if mention.set.has_use_or_mod() {
+                InstPoint::new_use(mention.iix)
+            } else {
+                InstPoint::new_def(mention.iix)
+            }
+        }
         None => {
+            // The current interval has no uses, spill it directly.
             state.spill(cur_id);
             return Ok(());
         }
@@ -931,8 +933,8 @@ fn maybe_handle_safepoints<F: Function>(state: &mut State<F>, id: IntId) -> bool
     lsra_assert!(int.start.iix() <= sp_iix && sp_iix <= int.end.iix());
 
     let sp_def = InstPoint::new_def(sp_iix);
-    if let Some(prev_use) = last_use(&state.intervals.get(id), sp_def, &state.reg_uses) {
-        if prev_use == sp_def {
+    if let Some(prev_mention) = last_mention(&state.intervals.get(id), sp_def) {
+        if prev_mention.iix == sp_iix && prev_mention.set.has_mod_or_def() {
             // The value is being redefined by the instruction; there's no need to keep it alive on the
             // stack, and we can use the same register assignment before and after the safepoint.
             return true;
@@ -1025,32 +1027,60 @@ fn next_pos(mut pos: InstPoint) -> InstPoint {
     pos
 }
 
-/// Splits the given interval between the last use before `split_pos` and
-/// `split_pos`.
+/// Given an allocated interval and a split position, splits the interval so that its allocation
+/// is reusable at the `split_pos`. This may or may not cause a spill of the interval.
 ///
-/// In case of two-ways split (i.e. only place to split is precisely split_pos),
-/// returns the live interval id for the middle child, to be added back to the
-/// list of active/inactive intervals after iterating on these.
+/// Precisely, it's split this way, *if there's space to do so*:
+///
+/// - consider PU, the previous use before the split position.
+/// - consider NU, the next use after the split position.
+///
+/// From [start ---------------------------------------------------------- end]
+///
+///      [start ------------- PU] ]PU --------------- NU[ [NU ------------ end]
+///       |                        |                       |
+///       \-> keep previous alloc  \-> spill               \-> unallocated
+///
+/// The last interval is put back into the allocation queue, to be allocated later.
+///
+/// If there's no space to do so (see below), the interval is split before the split position,
+/// and the child interval is inserted into the allocation queue.
 fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: InstPoint) {
     debug_assert!(state.intervals.get(id).covers(split_pos));
 
-    let child = match last_use(&state.intervals.get(id), split_pos, &state.reg_uses) {
-        Some(last_use) => {
+    let child = match last_mention(&state.intervals.get(id), split_pos) {
+        Some(prev_mention) => {
             debug!(
                 "split_and_spill {:?}: spill between {:?} and {:?}",
-                id, last_use, split_pos
+                id, prev_mention, split_pos
             );
 
-            let after_last_use = next_pos(last_use);
-            let optimal_pos = if after_last_use >= split_pos {
-                // Either last_use is split_pos, or it is just before. We have to split at
-                // split_pos then to fulfill the caller's want.
-                // TODO: if it's a MOD, then we should take the position before.
-                split_pos
+            let optimal_pos = if prev_mention.iix == split_pos.iix() {
+                // The interval we want to split has a mention at the split position; it's
+                // conceptually before the split position.
+                if split_pos.pt() == Point::Use || !prev_mention.set.has_mod() {
+                    // - If we must split at the use point, we're fine: the mention set at this
+                    // same instruction has a use too.
+                    // - If we must split at the def point, we can only do so if there's no mod
+                    // (otherwise we'd split a mod in two).
+                    split_pos
+                } else {
+                    // There's no space to split and spill!  Force a split just before the split
+                    // position, and reinject the interval in the queue, hoping that a register
+                    // becomes free in the meanwhile.
+                    let child = split(state, id, InstPoint::new_use(split_pos.iix()));
+                    state.insert_unhandled(child);
+                    return;
+                }
             } else {
-                // Any position in this interval is valid and won't interfere with the previous
+                // Any position in this range is valid and won't interfere with the previous
                 // mention.
-                find_optimal_split_pos(state, id, after_last_use, split_pos)
+                let prev_mention_inst = if prev_mention.set.has_mod_or_def() {
+                    InstPoint::new_def(prev_mention.iix)
+                } else {
+                    InstPoint::new_use(prev_mention.iix)
+                };
+                find_optimal_split_pos(state, id, next_pos(prev_mention_inst), split_pos)
             };
 
             let child = split(state, id, optimal_pos);
@@ -1100,9 +1130,15 @@ fn try_split_regs<F: Function>(
     state.stats.as_mut().map(|stats| stats.num_reg_splits += 1);
 
     // Find a position for the split: we'll iterate backwards from the point until the register is
-    // available, down to the previous use of the current interval.
-    let prev_use = match last_use(&state.intervals.get(id), available_until, &state.reg_uses) {
-        Some(prev_use) => prev_use,
+    // available, down to the previous mention of the current interval.
+    let prev_use = match last_mention(&state.intervals.get(id), available_until) {
+        Some(prev_mention) => {
+            if prev_mention.set.has_mod_or_def() {
+                InstPoint::new_def(prev_mention.iix)
+            } else {
+                InstPoint::new_use(prev_mention.iix)
+            }
+        }
         None => state.intervals.get(id).start,
     };
 
@@ -1161,8 +1197,11 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
 
     // We're splitting in the middle of a fragment: [L, R].
     // Split it into two fragments: parent [L, pos[ + child [pos, R].
-    debug_assert!(int.start < int.end, "trying to split unit fragment");
-    debug_assert!(int.start <= at_pos, "no space to split fragment");
+    debug_assert!(
+        int.start < int.end,
+        "trying to split unit interval (split iloop!)"
+    );
+    debug_assert!(int.start <= at_pos, "no space to split interval");
 
     let parent_start = int.start;
     let parent_end = prev_pos(at_pos);
@@ -1170,7 +1209,7 @@ fn split<F: Function>(state: &mut State<F>, id: IntId, at_pos: InstPoint) -> Int
     let child_end = int.end;
 
     trace!(
-        "split fragment [{:?}; {:?}] into two parts: [{:?}; {:?}] to [{:?}; {:?}]",
+        "split interval [{:?}; {:?}] into two parts: [{:?}; {:?}] to [{:?}; {:?}]",
         int.start,
         int.end,
         parent_start,

@@ -12,7 +12,7 @@ b0:
 b1:
     immf    r1F, 42.0
     fmul    r0F, r1F, v0F
-    immf    v2F, 0.000000000000000000000000000000000000023509886
+    immf    v2F, 0.000000000000000000000000000000000000023509886    ; i5
     goto    b3:b3
 
 b2:
@@ -20,6 +20,6 @@ b2:
     goto    b1:b1
 
 b3:
-    fcossin v2F, r1F
+    fcossin v2F, r1F                                                ; i9
     fdiv    r1F, r0F, r0F
     goto    b3:b3
