@@ -555,13 +555,14 @@ fn last_mention(interval: &VirtualInterval, pos: InstPoint) -> Option<InstMentio
             // Precise match. If we're looking for anything before (including) the def we're done:
             // the mention set contains one of use/mod/def. Otherwise, we're looking for any
             // mention before (including) the use point, so the mention set should include it.
-            if pos.pt() == Point::Def || mentions[index].set.has_use() {
+            if pos.pt() == Point::Def || mentions[index].set.has_use_or_mod() {
                 Some(mentions[index])
             } else if index > 0 {
-                // Otherwise, if we're not on the first element, the right mention is the previous
-                // element.
+                // Otherwise, if we're not on the first element, the right answer is the previous
+                // mention.
                 Some(mentions[index - 1])
             } else {
+                // There's no previous mention.
                 None
             }
         }

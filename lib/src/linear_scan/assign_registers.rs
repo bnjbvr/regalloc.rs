@@ -598,6 +598,9 @@ fn lazy_compute_inactive(
 
 /// Naive heuristic to select a register when we're not aware of any conflict.
 /// Currently, it chooses the register with the furthest next use.
+///
+/// Returns a solution, if it finds one, consisting of the selected register, as well as the
+/// first point (included) where the register is not available anymore.
 #[inline(never)]
 fn select_naive_reg<F: Function>(
     reusable: &mut ReusableState,
@@ -689,7 +692,7 @@ fn try_allocate_reg<F: Function>(
     );
 
     if best_pos <= state.intervals.get(id).end {
-        if !state.opts.partial_split || !try_split_regs(state, id, best_pos) {
+        if !try_split_regs(state, id, best_pos) {
             return false;
         }
     }
@@ -866,9 +869,8 @@ fn allocate_blocked_reg<F: Function>(
                 "allocate_blocked_reg: fixed conflict! blocked at {:?}, while ending at {:?}",
                 block_pos[best_reg], int_end
             );
-
-            if !state.opts.partial_split || !try_split_regs(state, cur_id, block_pos[best_reg]) {
-                split_and_spill(state, cur_id, block_pos[best_reg]);
+            if !try_split_regs(state, cur_id, block_pos[best_reg]) {
+                split_evict(state, cur_id, block_pos[best_reg]);
             }
         }
 
@@ -883,7 +885,7 @@ fn allocate_blocked_reg<F: Function>(
                         if reg == best_reg {
                             // spill it!
                             debug!("allocate_blocked_reg: split and spill active stolen reg");
-                            split_and_spill(state, int_id, start_pos);
+                            split_evict(state, int_id, start_pos);
                             break;
                         }
                     }
@@ -941,7 +943,7 @@ fn maybe_handle_safepoints<F: Function>(state: &mut State<F>, id: IntId) -> bool
         }
 
         // The value is not redefined by the instruction, split and spill before the safepoint.
-        split_and_spill(state, id, InstPoint::new_use(sp_iix));
+        split_evict(state, id, InstPoint::new_use(sp_iix));
         return true;
     }
 
@@ -1032,40 +1034,46 @@ fn next_pos(mut pos: InstPoint) -> InstPoint {
 ///
 /// Precisely, it's split this way, *if there's space to do so*:
 ///
-/// - consider PU, the previous use before the split position.
-/// - consider NU, the next use after the split position.
+/// - consider PM, the previous mention before the split position.
+/// - consider NM, the next mention after the split position.
 ///
 /// From [start ---------------------------------------------------------- end]
 ///
-///      [start ------------- PU] ]PU --------------- NU[ [NU ------------ end]
+///      [start ------------- PM] ]PM --------------- NM[ [NM ------------ end]
 ///       |                        |                       |
 ///       \-> keep previous alloc  \-> spill               \-> unallocated
 ///
 /// The last interval is put back into the allocation queue, to be allocated later.
 ///
-/// If there's no space to do so (see below), the interval is split before the split position,
-/// and the child interval is inserted into the allocation queue.
-fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: InstPoint) {
+/// If there's no space to do so (split_pos is (PM.ix, Def), PM.set includes mod), the interval is
+/// split before the split position, and the child interval is inserted back into the allocation
+/// queue.
+fn split_evict<F: Function>(state: &mut State<F>, id: IntId, split_pos: InstPoint) {
     debug_assert!(state.intervals.get(id).covers(split_pos));
 
     let child = match last_mention(&state.intervals.get(id), split_pos) {
         Some(prev_mention) => {
             debug!(
-                "split_and_spill {:?}: spill between {:?} and {:?}",
+                "split_evict {:?}: spill between {:?} and {:?}",
                 id, prev_mention, split_pos
             );
 
             let optimal_pos = if prev_mention.iix == split_pos.iix() {
-                // The interval we want to split has a mention at the split position; it's
-                // conceptually before the split position.
+                // The interval we want to split has a mention at the split position; we need to be
+                // careful here. Remember the mention is located before the split position.
                 if split_pos.pt() == Point::Use || !prev_mention.set.has_mod() {
-                    // - If we must split at the use point, we're fine: the mention set at this
-                    // same instruction has a use too.
+                    // - If we must split at the use point, the mention set at this same
+                    // instruction must have a use too. So the child will start with this precise
+                    // InstPoint, and we're good.
                     // - If we must split at the def point, we can only do so if there's no mod
-                    // (otherwise we'd split a mod in two).
+                    // (otherwise we'd split a mod in two). Two sub-cases to consider:
+                    //    - If def is in the mention set, then the child interval will start at the
+                    //    def side, which is correct (it's a new def).
+                    //    - If not, then there's a use in the mention set, and splitting at the def
+                    //    point works too (it's located after the use point).
                     split_pos
                 } else {
-                    // There's no space to split and spill!  Force a split just before the split
+                    // There's no space to split and spill! Force a split just before the split
                     // position, and reinject the interval in the queue, hoping that a register
                     // becomes free in the meanwhile.
                     let child = split(state, id, InstPoint::new_use(split_pos.iix()));
@@ -1092,7 +1100,7 @@ fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: Inst
             // The current interval has no uses before the split position, it can
             // safely be spilled.
             debug!(
-                "split_and_spill {:?}: spilling it since no uses before split position",
+                "split_evict {:?}: spilling it since no uses before split position",
                 id
             );
             state.spill(id);
@@ -1122,11 +1130,18 @@ fn split_and_spill<F: Function>(state: &mut State<F>, id: IntId, split_pos: Inst
 /// Try to find a (use) position where to split the interval until the next point at which it
 /// becomes unavailable, and put it back into the queue of intervals to allocate later on.  Returns
 /// true if it succeeded in finding such a position, false otherwise.
+///
+/// `available_until` is the first point (included) where the register allocated to the given
+/// interval isn't available anymore.
 fn try_split_regs<F: Function>(
     state: &mut State<F>,
     id: IntId,
     available_until: InstPoint,
 ) -> bool {
+    if !state.opts.partial_split {
+        return false;
+    }
+
     state.stats.as_mut().map(|stats| stats.num_reg_splits += 1);
 
     // Find a position for the split: we'll iterate backwards from the point until the register is
